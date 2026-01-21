@@ -20,43 +20,61 @@ def lbm_solver(mask, u_wind, v_wind, nx, ny, iterations=1000):
         cu = u_wind * cx[k] + v_wind * cy[k]
         f[:, :, k] = rho * w[k] * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
 
+    # Bufor tymczasowy do streamingu (aby uniknąć nadpisywania danych)
+    f_new = np.zeros((ny, nx))
+
     # Pętla symulacji
     for _ in range(iterations):
-        # 1. Streaming (przesuwanie) - POPRAWKA DLA NUMBA
+        
+        # 1. STREAMING (Przesuwanie cząsteczek)
+        # Zamiast np.roll (który sprawia błędy w Numbie), używamy jawnych pętli.
+        # Numba kompiluje to do super-szybkiego kodu maszynowego.
         for k in range(9):
-            # Numba nie lubi axis=(0,1), więc robimy to w dwóch krokach:
-            # Krok A: Przesunięcie w pionie (oś 0)
-            temp = np.roll(f[:, :, k], cy[k], axis=0)
-            # Krok B: Przesunięcie w poziomie (oś 1)
-            f[:, :, k] = np.roll(temp, cx[k], axis=1)
+            shift_x = cx[k]
+            shift_y = cy[k]
             
+            # Reset bufora
+            f_new[:] = 0.0
+            
+            # Ręczne przesuwanie z zawijaniem (periodic boundary)
+            # Pythonowe % działa poprawnie dla liczb ujemnych (np. -1 % 200 = 199)
+            for y in range(ny):
+                target_y = (y + shift_y) % ny
+                for x in range(nx):
+                    target_x = (x + shift_x) % nx
+                    f_new[target_y, target_x] = f[y, x, k]
+            
+            # Przepisanie wyniku z powrotem do f
+            f[:, :, k] = f_new
+
         # 2. Collision (BGK)
         rho = np.sum(f, axis=2)
-        ux = np.sum(f * cx, axis=2) / rho
-        uy = np.sum(f * cy, axis=2) / rho
+        # Zabezpieczenie przed dzieleniem przez zero (choć rho ~ 1.0)
+        inv_rho = 1.0 / rho
         
-        # Wymuszanie wiatru na brzegach (boundary inflow)
+        ux = np.sum(f * cx, axis=2) * inv_rho
+        uy = np.sum(f * cy, axis=2) * inv_rho
+        
+        # Wymuszanie wiatru na lewej krawędzi (inflow boundary)
         ux[:, 0] = u_wind
         uy[:, 0] = v_wind
 
         # Relaksacja do równowagi
         omega = 1.2 # Parametr lepkości
         u_sq = ux**2 + uy**2
+        
         for k in range(9):
             cu = ux * cx[k] + uy * cy[k]
             f_eq = rho * w[k] * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
             f[:, :, k] += omega * (f_eq - f[:, :, k])
             
         # 3. Obsługa przeszkód (Boundary conditions)
-        # Reset prędkości wewnątrz budynków/terenu
         for y in range(ny):
             for x in range(nx):
                 if mask[y, x] > 0:
                     ux[y, x] = 0
                     uy[y, x] = 0
-                    # Odbicie (uproszczone) - zachowanie masy
-                    # W pełnym LBM robi się tutaj 'bounce-back', 
-                    # ale dla wizualizacji wystarczy reset prędkości.
+                    # Prosty bounce-back (reset prędkości w przeszkodzie)
 
     return ux, uy
 
@@ -72,17 +90,16 @@ def run_simulation(mask_array, params, geo_transform):
     """
     ny, nx = mask_array.shape
     
-    # 1. Konwersja wiatru (speed/dir -> u/v)
-    # Konwersja stopni meteo (0=N, 90=E) na kartezjańskie
+    # 1. Konwersja wiatru
     rad = np.deg2rad(270 - params['wind_dir']) 
-    u_in = params['wind_speed'] * np.cos(rad) * 0.1 # Skalowanie prędkości w siatce
+    u_in = params['wind_speed'] * np.cos(rad) * 0.1 
     v_in = params['wind_speed'] * np.sin(rad) * 0.1
     
     # 2. Obliczenia
     print(f"🌪️ Obliczenia LBM start: {nx}x{ny}, iteracje: {params['iterations']}")
     start_t = time.time()
     
-    # Wywołanie funkcji skompilowanej przez Numba
+    # Wywołanie funkcji
     ux, uy = lbm_solver(mask_array, u_in, v_in, nx, ny, params['iterations'])
     
     print(f"✅ Koniec obliczeń w {time.time() - start_t:.2f}s")
@@ -91,15 +108,12 @@ def run_simulation(mask_array, params, geo_transform):
     stride = 10
     particles = []
     
-    # Iteracja po siatce co 'stride' punktów
     for y in range(0, ny, stride):
         for x in range(0, nx, stride):
-            if mask_array[y, x] == 0: # Tylko powietrze
-                # Konwersja pixel -> geo
+            if mask_array[y, x] == 0: 
                 lat, lng = geo_transform(x, y)
-                
-                # Zapisujemy tylko jeśli prędkość jest istotna (filtr szumów)
                 speed = np.sqrt(ux[y,x]**2 + uy[y,x]**2)
+                
                 if speed > 0.001:
                     particles.append({
                         "lat": round(lat, 6),
@@ -108,13 +122,12 @@ def run_simulation(mask_array, params, geo_transform):
                         "v": round(float(uy[y,x]), 4)
                     })
 
-    # 4. Obliczanie granic (bounds) dla mapy
+    # 4. Obliczanie granic (bounds)
     if particles:
         lats = [p['lat'] for p in particles]
         lngs = [p['lng'] for p in particles]
         bounds = [[min(lats), min(lngs)], [max(lats), max(lngs)]]
     else:
-        # Fallback gdyby nic nie policzyło (np. same przeszkody)
         bounds = [[52.0, 21.0], [52.1, 21.1]]
 
     return {
